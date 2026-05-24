@@ -326,9 +326,9 @@ def parse_boxscore(boxscore_text, team_abbr):
             elif key == 'outsatend':
                 game_data['metadata']['outsatend'] = int(value.strip('#')) if value else None
             continue
-        # Only trigger on lines that clearly look like team stat headers (reject lines starting with "line:")
-        if re.match(r'^[A-Za-z][A-Za-z\s]+:\s*(ab|r|h|po|a|e|rbi|sb|sh|2b|3b)', line, re.IGNORECASE) and not line.lower().startswith('line:'):
-            header_match = re.match(r'^([A-Za-z][A-Za-z\s]+):\s*(.+)$', line)
+                # Only trigger on lines that clearly look like team stat headers (reject lines starting with "line:")
+        if re.match(r"^[A-Za-z][A-Za-z'.\s,-]+:\s*(ab|r|h|po|a|e|rbi|sb|sh|2b|3b)", line, re.IGNORECASE) and not line.lower().startswith('line:'):
+            header_match = re.match(r"^([A-Za-z][A-Za-z'.\s,-]+):\s*(.+)$", line)
             if header_match:
                 team_name = header_match.group(1).strip()
                 header_raw = header_match.group(2).strip().upper()
@@ -392,7 +392,7 @@ def parse_boxscore(boxscore_text, team_abbr):
                     logging.warning(f"[gid={gid}] Failed to unpack roster line: {line}, error: {e}")
                     continue
                 # logging.warning(f"[gid={gid}] Parsing roster line: {line}, player_id='{player_id}', team={current_team}, pos={pos}")
-                if not player_id.strip() or not re.match(r'[A-Za-z][A-Za-z.\s,]*[A-Za-z]', player_id.strip()):
+                if not player_id.strip() or not re.match(r"[A-Za-z][A-Za-z'.\s,-]*[A-Za-z]", player_id.strip()):
                     logging.warning(f"[gid={gid}] Skipping invalid player ID in roster line: {line}")
                     continue
                 stats = stats.strip().split()
