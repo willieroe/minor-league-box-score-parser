@@ -169,8 +169,31 @@ def extract_lname_initial(name_str):
     return lname, initial
 
 def standardize_player_id(match_id, identifier=None, team=None, player_team=None, gid="Unknown"):
-    """Convert matchID to playerID format, handling initials and single names."""
+    """Convert matchID to playerID format, handling initials and single names.
+
+    This function is defensive against transcription/OCR noise such as
+    stray brackets or braces that sometimes appear in historical box scores
+    (e.g. 'Smith[JON}' or 'O'Neill[1]').
+    """
     match_id = match_id.strip().rstrip(',')
+
+    # Defensive cleaning for noisy transcriptions (e.g. 'Smith[JON}' or 'O'Neill[1]')
+    # If brackets/braces are present and no identifier was passed in, try to extract one.
+    if not identifier and ('[' in match_id or '{' in match_id):
+        # Extract content from first bracket/brace group as identifier
+        m = re.search(r'[\[{](.+?)[\]}]', match_id)
+        if m:
+            identifier = m.group(1).strip()
+        # Remove bracket/brace junk and collapse multiple spaces
+        match_id = re.sub(r'[\[\]{}]', ' ', match_id)
+        match_id = re.sub(r'\s+', ' ', match_id).strip()
+
+        # If after cleaning we have multiple tokens and no dot-initial,
+        # keep only the first token as the name (the rest was likely identifier junk)
+        tokens = match_id.split()
+        if len(tokens) > 1 and not any(t.endswith('.') for t in tokens):
+            match_id = tokens[0]
+
     if not match_id:
         logging.warning(f"[gid={gid}] Empty player ID encountered")
         return "Unknown"
@@ -202,7 +225,10 @@ def standardize_player_id(match_id, identifier=None, team=None, player_team=None
         player_id = f"{lname}, {initial}" if initial else lname
 
     if identifier:
-        player_id += f"[{identifier}]"
+        # Clean any stray brackets that may have leaked into the identifier
+        clean_identifier = re.sub(r'[\[\]{}]', '', identifier).strip()
+        if clean_identifier:
+            player_id += f"[{clean_identifier}]"
 
     if team and player_team and player_id != "Unknown":
         for pid, pteam in player_team.items():
@@ -326,7 +352,7 @@ def parse_boxscore(boxscore_text, team_abbr):
             elif key == 'outsatend':
                 game_data['metadata']['outsatend'] = int(value.strip('#')) if value else None
             continue
-                # Only trigger on lines that clearly look like team stat headers (reject lines starting with "line:")
+        # Only trigger on lines that clearly look like team stat headers (reject lines starting with "line:")
         if re.match(r"^[A-Za-z][A-Za-z'.\s,-]+:\s*(ab|r|h|po|a|e|rbi|sb|sh|2b|3b)", line, re.IGNORECASE) and not line.lower().startswith('line:'):
             header_match = re.match(r"^([A-Za-z][A-Za-z'.\s,-]+):\s*(.+)$", line)
             if header_match:
@@ -524,8 +550,8 @@ def parse_boxscore(boxscore_text, team_abbr):
                     stat = stat.lstrip('~')
                     identifier = None
                     if '[' in stat and ']' in stat:
-                        stat, identifier_group = stat.split('[')
-                        identifier = identifier_group.strip(']')
+                        stat, identifier_group = stat.split('[', 1)
+                        identifier = identifier_group.split(']')[0].strip()
                     player_id = standardize_player_id(stat, identifier, current_team, player_team, gid)
                     if player_id == "Unknown":
                         logging.warning(f"[gid={gid}] Skipping invalid player in stat {stat_type}: {stat}")
