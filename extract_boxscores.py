@@ -23,7 +23,7 @@ GAMEINFO_FIELDNAMES = [
     'tiebreaker', 'userdh', 'htbf', 'timeofgame', 'attendance', 'fieldcond', 'precip', 'sky',
     'temp', 'winddir', 'windspeed', 'oscorer', 'forfeit', 'suspend', 'umphome', 'ump1b',
     'ump2b', 'ump3b', 'umplf', 'umprf', 'wp', 'lp', 'save', 'gametype', 'vruns', 'hruns',
-    'wteam', 'lteam', 'line', 'batteries', 'lineups', 'box', 'php', 'season', 'source', 'status',
+    'wteam', 'lteam', 'line', 'batteries', 'lineups', 'box', 'pbp', 'season', 'source', 'status',
     'status-reason'
 ]
 
@@ -90,7 +90,7 @@ def create_minimal_gameinfo_row(gid, game_data, team_abbr):
         'batteries': '',
         'lineups': 'n',
         'box': 'n',
-        'php': '',
+        'pbp': '',
         'season': game_data['metadata']['date'][:4] if game_data['metadata']['date'] else '',
         'source': game_data['metadata']['source'],
         'status': game_data['metadata']['status'],
@@ -132,13 +132,22 @@ def parse_ip(ip_str):
         logging.warning(f"Invalid IP format: {ip_str}")
         return 0
 
-def parse_time_to_minutes(time_str):
-    """Convert time (e.g., 2:05) to minutes."""
+def parse_time_to_minutes(time_str, gid="Unknown"):
+    """Convert time (e.g., 2:05 or 0:55) to minutes."""
+    if time_str is None:
+        return None
+    cleaned = str(time_str).strip().strip('#')
+    if not cleaned:
+        # T: present but no time given in the box — treat as missing, not invalid
+        return None
     try:
-        h, m = map(int, time_str.split(':'))
+        parts = cleaned.split(':')
+        if len(parts) != 2:
+            raise ValueError("expected H:MM")
+        h, m = int(parts[0]), int(parts[1])
         return h * 60 + m
     except ValueError:
-        logging.warning(f"Invalid time format: {time_str}")
+        logging.warning(f"[gid={gid}] Invalid time format: {time_str!r}")
         return None
 
 def get_defensive_outs(team, game_data):
@@ -169,8 +178,31 @@ def extract_lname_initial(name_str):
     return lname, initial
 
 def standardize_player_id(match_id, identifier=None, team=None, player_team=None, gid="Unknown"):
-    """Convert matchID to playerID format, handling initials and single names."""
+    """Convert matchID to playerID format, handling initials and single names.
+
+    This function is defensive against transcription/OCR noise such as
+    stray brackets or braces that sometimes appear in historical box scores
+    (e.g. 'Smith[JON}' or 'O'Neill[1]').
+    """
     match_id = match_id.strip().rstrip(',')
+
+    # Defensive cleaning for noisy transcriptions (e.g. 'Smith[JON}' or 'O'Neill[1]')
+    # If brackets/braces are present and no identifier was passed in, try to extract one.
+    if not identifier and ('[' in match_id or '{' in match_id):
+        # Extract content from first bracket/brace group as identifier
+        m = re.search(r'[\[{](.+?)[\]}]', match_id)
+        if m:
+            identifier = m.group(1).strip()
+        # Remove bracket/brace junk and collapse multiple spaces
+        match_id = re.sub(r'[\[\]{}]', ' ', match_id)
+        match_id = re.sub(r'\s+', ' ', match_id).strip()
+
+        # If after cleaning we have multiple tokens and no dot-initial,
+        # keep only the first token as the name (the rest was likely identifier junk)
+        tokens = match_id.split()
+        if len(tokens) > 1 and not any(t.endswith('.') for t in tokens):
+            match_id = tokens[0]
+
     if not match_id:
         logging.warning(f"[gid={gid}] Empty player ID encountered")
         return "Unknown"
@@ -202,7 +234,10 @@ def standardize_player_id(match_id, identifier=None, team=None, player_team=None
         player_id = f"{lname}, {initial}" if initial else lname
 
     if identifier:
-        player_id += f"[{identifier}]"
+        # Clean any stray brackets that may have leaked into the identifier
+        clean_identifier = re.sub(r'[\[\]{}]', '', identifier).strip()
+        if clean_identifier:
+            player_id += f"[{clean_identifier}]"
 
     if team and player_team and player_id != "Unknown":
         for pid, pteam in player_team.items():
@@ -295,8 +330,6 @@ def parse_boxscore(boxscore_text, team_abbr):
                 game_data['metadata']['gametype'] = value
             elif key == 'batted-first':
                 game_data['metadata']['batted-first'] = value
-            elif key == 'T':
-                game_data['metadata']['time'] = parse_time_to_minutes(value)
             elif key == 'U':
                 game_data['metadata']['umpires'] = [u.strip() for u in value.split(';')]
             elif key == 'outsatend':
@@ -314,19 +347,29 @@ def parse_boxscore(boxscore_text, team_abbr):
         if not line or line.startswith('---'):
             current_team = None
             continue
-        if line.startswith('note:') or line.startswith('recap_'):
+        if line.startswith('note:'):
             game_data['notes'].append({'gid': gid, 'text': line})
             continue
+            # recap_B_ / recap_P_ / recap_F_ are transcribed recap stats, not notes.
+            # Strip the prefix so the existing B_/P_/F_ handler processes them.
+        if line.startswith('recap_'):
+            line = line[len('recap_'):].strip()
+            if not line:
+                continue
         if line.startswith(('T:', 'U:', 'outsatend:')):
             key, value = map(str.strip, line.split(':', 1))
             if key == 'T':
-                game_data['metadata']['time'] = parse_time_to_minutes(value)
-            elif key == 'U':
-                game_data['metadata']['umpires'] = [u.strip() for u in value.split(';')]
-            elif key == 'outsatend':
-                game_data['metadata']['outsatend'] = int(value.strip('#')) if value else None
-            continue
-                # Only trigger on lines that clearly look like team stat headers (reject lines starting with "line:")
+                # Always derive gid from metadata here so warnings are never [gid=Unknown]
+                # just because the loop variable was not yet set.
+                home_abbr = team_abbr.get(game_data['metadata'].get('home'), 'UNK')
+                time_gid = (
+                    f"{home_abbr}{game_data['metadata'].get('date', '')}"
+                    f"{game_data['metadata'].get('number', 0)}"
+                    if game_data['metadata'].get('home') or game_data['metadata'].get('date')
+                    else gid
+                )
+                game_data['metadata']['time'] = parse_time_to_minutes(value, time_gid)
+        # Only trigger on lines that clearly look like team stat headers (reject lines starting with "line:")
         if re.match(r"^[A-Za-z][A-Za-z'.\s,-]+:\s*(ab|r|h|po|a|e|rbi|sb|sh|2b|3b)", line, re.IGNORECASE) and not line.lower().startswith('line:'):
             header_match = re.match(r"^([A-Za-z][A-Za-z'.\s,-]+):\s*(.+)$", line)
             if header_match:
@@ -334,7 +377,7 @@ def parse_boxscore(boxscore_text, team_abbr):
                 header_raw = header_match.group(2).strip().upper()
 
                 known_non_team = {'line', 'date', 'number', 'league', 'away', 'home', 'source',
-                                  'batteries', 'lineups', 'box', 'php', 'season'}
+                                  'batteries', 'lineups', 'box', 'pbp', 'season'}
 
                 if team_name.lower() not in known_non_team:
                     # Normalize tokens
@@ -522,10 +565,20 @@ def parse_boxscore(boxscore_text, team_abbr):
                         stat, count_str = stat.split('#')
                         count = parse_ip(count_str) if stat_type == 'P_IP' else int(count_str)
                     stat = stat.lstrip('~')
+
+                    # Special handling for B_XO (format: "Carey, hit by batted ball")
+                    # Everything before the first comma is the player ID
+                    if stat_type == 'B_XO' and ',' in stat:
+                        stat = stat.split(',', 1)[0].strip()
+
                     identifier = None
                     if '[' in stat and ']' in stat:
-                        stat, identifier_group = stat.split('[')
-                        identifier = identifier_group.strip(']')
+                        # More robust extraction that handles trailing spaces, extra chars after ], etc.
+                        m = re.search(r'\[([^\]]+)\]', stat)
+                        if m:
+                            identifier = m.group(1).strip()
+                        # Remove the entire bracketed identifier portion so only the clean name remains
+                        stat = re.sub(r'\s*\[[^\]]+\]\s*', ' ', stat).strip()
                     player_id = standardize_player_id(stat, identifier, current_team, player_team, gid)
                     if player_id == "Unknown":
                         logging.warning(f"[gid={gid}] Skipping invalid player in stat {stat_type}: {stat}")
@@ -751,7 +804,7 @@ def write_csvs(game_data, gid, lineup_positions, team_abbr, output_dir, dp_count
         'batteries': '',
         'lineups': 'y' if len(game_data['teams'].get(game_data['metadata']['away'], {}).get('players', [])) >= 9 else 'n',
         'box': 'y' if len(game_data['teams'].get(game_data['metadata']['away'], {}).get('players', [])) >= 9 else 'n',
-        'php': '',
+        'pbp': '',
         'season': game_data['metadata']['date'][:4],
         'source': game_data['metadata']['source'],
         'status': game_data['metadata']['status'],
