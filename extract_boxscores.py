@@ -132,7 +132,7 @@ def parse_ip(ip_str):
         logging.warning(f"Invalid IP format: {ip_str}")
         return 0
 
-def parse_time_to_minutes(time_str, gid="Unknown"):
+def parse_time_to_minutes(time_str, gid):
     """Convert time (e.g., 2:05 or 0:55) to minutes."""
     if time_str is None:
         return None
@@ -350,8 +350,8 @@ def parse_boxscore(boxscore_text, team_abbr):
         if line.startswith('note:'):
             game_data['notes'].append({'gid': gid, 'text': line})
             continue
-            # recap_B_ / recap_P_ / recap_F_ are transcribed recap stats, not notes.
-            # Strip the prefix so the existing B_/P_/F_ handler processes them.
+        # recap_B_ / recap_P_ / recap_F_ are transcribed recap stats, not notes.
+        # Strip the prefix so the existing B_/P_/F_ handler processes them.
         if line.startswith('recap_'):
             line = line[len('recap_'):].strip()
             if not line:
@@ -369,6 +369,11 @@ def parse_boxscore(boxscore_text, team_abbr):
                     else gid
                 )
                 game_data['metadata']['time'] = parse_time_to_minutes(value, time_gid)
+            elif key == 'U':
+                game_data['metadata']['umpires'] = [u.strip() for u in value.split(';')]
+            elif key == 'outsatend':
+                game_data['metadata']['outsatend'] = int(value.strip('#')) if value else None
+            continue
         # Only trigger on lines that clearly look like team stat headers (reject lines starting with "line:")
         if re.match(r"^[A-Za-z][A-Za-z'.\s,-]+:\s*(ab|r|h|po|a|e|rbi|sb|sh|2b|3b)", line, re.IGNORECASE) and not line.lower().startswith('line:'):
             header_match = re.match(r"^([A-Za-z][A-Za-z'.\s,-]+):\s*(.+)$", line)
@@ -614,18 +619,35 @@ def parse_boxscore(boxscore_text, team_abbr):
             'player_id': player_id, 'team': team, 'stat': stat, 'count': count
         })
 
+    # Final detection of incomplete lineups (for minimal RHE-style where <9 players or incomplete positions)
+    # This ensures b_lp='' in batting.csv and clears start_l* for such cases, while full lineups (even without (~X.X) markers) keep 1-9
     for team, data in game_data['teams'].items():
+        players = data.get('players', [])
+        player_count = len(players)
+        # No roster lines at all (R-only / TOTALS-only boxes) is an incomplete lineup
+        if player_count < 9:
+            incomplete_lineups.add(team)
+            lineup_positions[team] = {}
+            continue
+        lp_values = [p['b_lp'] for p in players]
+        max_lp = max(lp_values, default=0)
+        unique_lps = len(set(lp_values))
+        if max_lp != 9 or unique_lps != 9:
+            incomplete_lineups.add(team)
+            lineup_positions[team] = {}
+
+    # Player-sum vs TOTALS — only for complete lineups (incomplete rosters cannot match TOTALS)
+    for team, data in game_data['teams'].items():
+        if team in incomplete_lineups:
+            continue
         if data['totals']:
-            # Initialize sums only for the stats we care about validating
             player_sums = {'ab': 0, 'r': 0, 'h': 0, 'po': 0, 'a': 0, 'e': 0, 'rbi': 0}
 
             for player in data['players']:
                 for stat in player_sums:
-                    # This is the key fix you asked about:
                     if stat in player and player[stat] is not None:
                         player_sums[stat] += player[stat]
 
-            # Now compare the cleaned player sum against the TOTALS line
             for stat in player_sums:
                 if stat in data['totals'] and data['totals'][stat] != player_sums[stat]:
                     game_data['discrepancies'].append({
@@ -634,51 +656,35 @@ def parse_boxscore(boxscore_text, team_abbr):
                         'discrepancy': f"player {stat.upper()} sum to {player_sums[stat]}, "
                                        f"TOTALS {stat.upper()} {data['totals'][stat]}"
                     })
-    # Final detection of incomplete lineups (for minimal RHE-style where <9 players or incomplete positions)
-    # This ensures b_lp='' in batting.csv and clears start_l* for such cases, while full lineups (even without (~X.X) markers) keep 1-9
-    for team, data in game_data['teams'].items():
-        players = data.get('players', [])
-        if players:
-            lp_values = [p['b_lp'] for p in players]
-            max_lp = max(lp_values, default=0)
-            unique_lps = len(set(lp_values))
-            player_count = len(players)
-            if max_lp != 9 or unique_lps != 9 or player_count < 9:
-                incomplete_lineups.add(team)
-                lineup_positions[team] = {}  # ensure start_l1..9 are blank for incomplete lineups
-        # Validation cross-check for defensive outs / p_ipouts (user requested for full boxes)
-        # Logs to discrepancies.csv if explicit (P_IP or team_po) and derived line-score value differ by >3 outs.
-        # This helps catch data entry errors in historical box scores while not overriding explicit values.
-        # Use safe access to vars defined in try block (in case of early return paths)
-        pitchers_per_team = locals().get('pitchers_per_team', {}) or {}
-        pitching_data = locals().get('pitching_data', []) or []
-        for team in game_data['teams']:
-            derived = get_defensive_outs(team, game_data)
-            if derived in (0, ''):
-                continue
-            # Check explicit from sole pitcher p_ipouts (set either from P_IP or our RHE fallback above)
-            explicit = None
-            if len(pitchers_per_team.get(team, [])) == 1:
-                for p in pitching_data:
-                    if p.get('team') == team_abbr.get(team, team):
-                        explicit = p.get('p_ipouts', 0)
-                        break
-            if explicit is not None and explicit != 0 and abs(explicit - derived) > 3:
+
+    # Validation cross-check for defensive outs / p_ipouts (user requested for full boxes)
+    # Logs to discrepancies.csv if explicit (P_IP or team_po) and derived line-score value differ by >3 outs.
+    pitchers_per_team = locals().get('pitchers_per_team', {}) or {}
+    pitching_data = locals().get('pitching_data', []) or []
+    for team in game_data['teams']:
+        derived = get_defensive_outs(team, game_data)
+        if derived in (0, ''):
+            continue
+        explicit = None
+        if len(pitchers_per_team.get(team, [])) == 1:
+            for p in pitching_data:
+                if p.get('team') == team_abbr.get(team, team):
+                    explicit = p.get('p_ipouts', 0)
+                    break
+        if explicit is not None and explicit != 0 and abs(explicit - derived) > 3:
+            game_data['discrepancies'].append({
+                'gid': gid,
+                'team': team_abbr.get(team, team),
+                'discrepancy': f"defensive outs: explicit P_IP {explicit} vs derived from line score {derived} (full box cross-check)"
+            })
+        else:
+            explicit_po = (game_data['teams'].get(team, {}).get('totals') or {}).get('po')
+            if explicit_po is not None and explicit_po != 0 and abs(explicit_po - derived) > 3:
                 game_data['discrepancies'].append({
                     'gid': gid,
                     'team': team_abbr.get(team, team),
-                    'discrepancy': f"defensive outs: explicit P_IP {explicit} vs derived from line score {derived} (full box cross-check)"
+                    'discrepancy': f"defensive outs: explicit team_po {explicit_po} vs derived from line score {derived} (full box cross-check)"
                 })
-            else:
-                # Also check vs team_po if present (for non-pitcher or aggregate)
-                explicit_po = (game_data['teams'].get(team, {}).get('totals') or {}).get('po')
-                if explicit_po is not None and explicit_po != 0 and abs(explicit_po - derived) > 3:
-                    game_data['discrepancies'].append({
-                        'gid': gid,
-                        'team': team_abbr.get(team, team),
-                        'discrepancy': f"defensive outs: explicit team_po {explicit_po} vs derived from line score {derived} (full box cross-check)"
-                    })
-    # logging.warning(f"[gid={gid}] Final player_team: {player_team}")
     return game_data, gid, lineup_positions, dp_counts, player_team, incomplete_lineups, dp_events
 
 # helper function
